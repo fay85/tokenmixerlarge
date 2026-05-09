@@ -1,5 +1,6 @@
 import argparse
 import csv
+import time
 import tensorflow as tf
 import numpy as np
 import random
@@ -46,6 +47,19 @@ parser.add_argument(
     action="store_true",
     default=False,
     help="Whether to enable XLA JIT compilation",
+)
+parser.add_argument(
+    "--precision",
+    choices=["fp32", "bf16", "mixed_bf16"],
+    default="fp32",
+    help="Numeric precision policy. 'bf16' uses bfloat16 for both variables and compute, "
+    "'mixed_bf16' uses bfloat16 compute with float32 variables.",
+)
+parser.add_argument(
+    "--disable_tf32",
+    action="store_true",
+    default=False,
+    help="Disable TensorFloat-32 kernels when available (recommended for cross-backend alignment).",
 )
 parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
 parser.add_argument("--batch_size", type=int, default=4096, help="Training/eval batch size")
@@ -173,6 +187,22 @@ parser.add_argument(
 args = parser.parse_args()
 
 
+def _configure_precision_policy(precision: str):
+    if precision == "fp32":
+        policy_name = "float32"
+        model_dtype = tf.float32
+    elif precision == "bf16":
+        policy_name = "bfloat16"
+        model_dtype = tf.bfloat16
+    elif precision == "mixed_bf16":
+        policy_name = "mixed_bfloat16"
+        model_dtype = tf.bfloat16
+    else:
+        raise ValueError(f"Unknown precision: {precision}")
+    tf.keras.mixed_precision.set_global_policy(policy_name)
+    return policy_name, model_dtype
+
+
 def _configure_musa_physical_devices(expose_all: bool, device_index: int) -> None:
     """Train loop is single-device; TF still enumerates every card unless we hide them."""
     try:
@@ -220,6 +250,17 @@ if args.backend == "cuda":
 
 if args.enable_xla:
     tf.config.optimizer.set_jit(True)
+
+if args.disable_tf32:
+    set_tf32 = getattr(tf.config.experimental, "enable_tensor_float_32_execution", None)
+    if callable(set_tf32):
+        try:
+            set_tf32(False)
+        except (RuntimeError, ValueError, TypeError):
+            pass
+
+POLICY_NAME, MODEL_DTYPE = _configure_precision_policy(args.precision)
+LABEL_DTYPE = MODEL_DTYPE
 
 
 ####################################################################################################
@@ -274,6 +315,10 @@ LOGGER_PRINT_INTERVAL = 100
 
 logger.info(f"seed={args.seed}, deterministic_alignment={args.deterministic_alignment}")
 logger.info(f"dataset={args.dataset}")
+logger.info(
+    f"precision={args.precision}, keras_policy={POLICY_NAME}, "
+    f"model_dtype={MODEL_DTYPE.name}, label_dtype={LABEL_DTYPE.name}, disable_tf32={args.disable_tf32}"
+)
 if args.backend == "musa":
     logger.info(
         f"musa_device_index={args.musa_device_index}, all_musa_devices={args.all_musa_devices}"
@@ -314,6 +359,10 @@ with open(metrics_csv_path, "w", newline="", encoding="utf-8") as fh:
             "valid_recall_pos",
             "valid_samples",
             "valid_pos_samples",
+            "avg_train_iter_sec",
+            "train_phase_sec",
+            "valid_phase_sec",
+            "epoch_total_sec",
         ]
     )
 
@@ -495,7 +544,15 @@ logger.info(
 )
 embedding_optimizer = tf.keras.optimizers.SGD(learning_rate=lr_schedule)
 other_optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
-criterion = tf.keras.losses.BinaryCrossentropy(from_logits=True)
+
+
+def binary_cross_entropy_with_logits(labels, logits):
+    labels = tf.cast(labels, logits.dtype)
+    per_example_loss = tf.nn.sigmoid_cross_entropy_with_logits(
+        labels=labels,
+        logits=logits,
+    )
+    return tf.reduce_mean(per_example_loss)
 
 ####################################################################################################
 #                                       CREATE DATALOADER                                          #
@@ -522,11 +579,28 @@ valid_dataset = get_dataset(
     shuffle_seed=args.seed,
 )
 
+if MODEL_DTYPE != tf.float32:
+    logger.info(f"Casting dense features and labels to {MODEL_DTYPE.name} in tf.data pipeline")
+
+    def _cast_batch_to_target_dtype(inputs, labels):
+        sparse_inputs, dense_inputs = inputs
+        return (
+            sparse_inputs,
+            tf.cast(dense_inputs, MODEL_DTYPE),
+        ), tf.cast(labels, LABEL_DTYPE)
+
+    train_dataset = train_dataset.map(
+        _cast_batch_to_target_dtype, num_parallel_calls=tf.data.AUTOTUNE
+    )
+    valid_dataset = valid_dataset.map(
+        _cast_batch_to_target_dtype, num_parallel_calls=tf.data.AUTOTUNE
+    )
+
 ####################################################################################################
 #                                    BUILD MODEL & SEPARATE VARS                                   #
 ####################################################################################################
 dummy_sparse = tf.zeros((1, NUM_CAT_FEATURES), dtype=tf.int32)
-dummy_dense = tf.zeros((1, NUM_DENSE_FEATURES), dtype=tf.float32)
+dummy_dense = tf.zeros((1, NUM_DENSE_FEATURES), dtype=MODEL_DTYPE)
 _ = model((dummy_sparse, dummy_dense))
 
 embedding_parameters = []
@@ -546,6 +620,12 @@ for var in model.trainable_variables:
 
 logger.info(f"Number of embedding parameters: {len(embedding_parameters)}")
 logger.info(f"Number of other parameters: {len(other_parameters)}")
+dtype_hist = {}
+for var in model.trainable_variables:
+    dtype_obj = var.dtype
+    key = dtype_obj.name if hasattr(dtype_obj, "name") else str(dtype_obj)
+    dtype_hist[key] = dtype_hist.get(key, 0) + 1
+logger.info(f"Trainable variable dtype histogram: {dtype_hist}")
 
 
 ####################################################################################################
@@ -556,29 +636,35 @@ def validate(model, dataset, max_batches=None):
     num_correct = 0
     pos_samples = 0
     pos_correct = 0
-    loss_metric = tf.keras.metrics.Mean()
-    auc_metric = tf.keras.metrics.AUC(name="validation_auc")
+    loss_metric = tf.keras.metrics.Mean(dtype=tf.float32)
+    auc_metric = tf.keras.metrics.AUC(name="validation_auc", dtype=tf.float32)
 
     for batch_idx, (inputs, labels) in enumerate(dataset):
         if max_batches is not None and batch_idx >= max_batches:
             break
         outputs = model(inputs, training=False)
 
-        labels = tf.cast(labels, tf.float32)
+        labels = tf.cast(labels, LABEL_DTYPE)
         outputs = tf.squeeze(outputs)
-        loss_metric.update_state(criterion(labels, outputs))
-        auc_metric.update_state(labels, tf.sigmoid(outputs))
+        batch_loss = binary_cross_entropy_with_logits(labels, outputs)
+        loss_metric.update_state(tf.cast(batch_loss, tf.float32))
+        auc_metric.update_state(
+            tf.cast(labels, tf.float32),
+            tf.cast(tf.sigmoid(outputs), tf.float32),
+        )
 
-        predictions = tf.cast(outputs >= 0, tf.float32)
+        predictions = tf.cast(outputs >= tf.cast(0.0, outputs.dtype), labels.dtype)
 
-        num_samples += labels.shape[0]
-        pos_samples += tf.reduce_sum(labels).numpy()
+        num_samples += int(tf.shape(labels)[0].numpy())
+        pos_samples += int(tf.reduce_sum(tf.cast(labels, tf.int64)).numpy())
 
-        correct_preds = tf.cast(tf.equal(predictions, labels), tf.float32)
-        num_correct += tf.reduce_sum(correct_preds).numpy()
+        correct_preds = tf.cast(tf.equal(predictions, labels), tf.int64)
+        num_correct += int(tf.reduce_sum(correct_preds).numpy())
 
-        pos_mask = tf.equal(labels, 1.0)
-        pos_correct += tf.reduce_sum(tf.boolean_mask(predictions, pos_mask)).numpy()
+        pos_mask = tf.equal(labels, tf.cast(1, labels.dtype))
+        pos_correct += int(
+            tf.reduce_sum(tf.cast(tf.boolean_mask(predictions, pos_mask), tf.int64)).numpy()
+        )
 
     accuracy = float(num_correct / num_samples) if num_samples > 0 else 0.0
     recall_pos = float(pos_correct / pos_samples) if pos_samples > 0 else 0.0
@@ -594,15 +680,17 @@ def validate(model, dataset, max_batches=None):
 def train_step(inputs, labels):
     with tf.GradientTape() as tape:
         outputs, aux_logits = model(inputs, training=True, return_aux=True)
-        prediction_loss = criterion(labels, tf.squeeze(outputs))
+        labels = tf.cast(labels, LABEL_DTYPE)
+        prediction_loss = binary_cross_entropy_with_logits(labels, tf.squeeze(outputs))
         if aux_logits:
             aux_losses = [
-                criterion(labels, tf.squeeze(aux_logit)) for aux_logit in aux_logits
+                binary_cross_entropy_with_logits(labels, tf.squeeze(aux_logit))
+                for aux_logit in aux_logits
             ]
             aux_loss = tf.add_n(aux_losses) / len(aux_losses)
         else:
-            aux_loss = 0.0
-        loss = prediction_loss + args.aux_loss_weight * aux_loss
+            aux_loss = tf.cast(0.0, dtype=prediction_loss.dtype)
+        loss = prediction_loss + tf.cast(args.aux_loss_weight, prediction_loss.dtype) * aux_loss
 
     grads = tape.gradient(loss, model.trainable_variables)
     grads_and_vars = [
@@ -646,35 +734,51 @@ other_lr_metric = tf.keras.metrics.Mean()
 
 for epoch in range(TRAIN_EPOCHS):
     logger.info(f"Starting Epoch {epoch+1}/{TRAIN_EPOCHS}")
-    epoch_loss_metric = tf.keras.metrics.Mean()
+    epoch_start_time = time.perf_counter()
+    train_phase_start_time = epoch_start_time
+    epoch_loss_metric = tf.keras.metrics.Mean(dtype=tf.float32)
+    train_iter_time_total = 0.0
+    train_iter_count = 0
 
     for batch_idx, (inputs, labels) in enumerate(train_dataset):
         if args.max_train_batches is not None and batch_idx >= args.max_train_batches:
             break
-        labels = tf.cast(labels, tf.float32)
+        iter_start_time = time.perf_counter()
+        labels = tf.cast(labels, LABEL_DTYPE)
 
         loss = train_step(inputs, labels)
-        epoch_loss_metric.update_state(loss)
+        train_iter_time_total += time.perf_counter() - iter_start_time
+        train_iter_count += 1
+        loss_fp32 = tf.cast(loss, tf.float32)
+        epoch_loss_metric.update_state(loss_fp32)
         current_lr = lr_schedule(step)
+        current_lr_fp32 = tf.cast(current_lr, tf.float32)
 
         if (batch_idx + 1) % LOGGER_PRINT_INTERVAL == 0:
             logger.info(
                 f"Epoch [{epoch+1}/{TRAIN_EPOCHS}], "
                 f"Batch [{batch_idx+1}/{TOTAL_STEPS_PER_EPOCH}], "
-                f"Loss: {loss.numpy():.4f}, "
-                f"LR: {current_lr.numpy():.6f}"
+                f"Loss: {float(loss_fp32.numpy()):.4f}, "
+                f"LR: {float(current_lr_fp32.numpy()):.6f}"
             )
 
         with summary_writer.as_default():
-            tf.summary.scalar("training_loss", loss, step=step)
-            tf.summary.scalar("optimizer_lr", current_lr, step=step)
+            tf.summary.scalar("training_loss", loss_fp32, step=step)
+            tf.summary.scalar("optimizer_lr", current_lr_fp32, step=step)
 
         step += 1
 
     train_loss = float(epoch_loss_metric.result().numpy())
+    train_phase_seconds = time.perf_counter() - train_phase_start_time
+    avg_train_iter_seconds = (
+        train_iter_time_total / train_iter_count if train_iter_count > 0 else 0.0
+    )
+    valid_phase_start_time = time.perf_counter()
     validation_loss, validation_auc, accuracy, num_samples, recall_pos, pos_samples = validate(
         model, valid_dataset, args.max_valid_batches
     )
+    valid_phase_seconds = time.perf_counter() - valid_phase_start_time
+    epoch_total_seconds = time.perf_counter() - epoch_start_time
 
     logger.info(
         f"Epoch {epoch+1}/{TRAIN_EPOCHS} Summary: "
@@ -684,7 +788,11 @@ for epoch in range(TRAIN_EPOCHS):
         f"Validation Accuracy: {float(accuracy)*100:.2f}%, "
         f"Total Samples: {num_samples}, "
         f"Positive Recall: {float(recall_pos)*100:.2f}%, "
-        f"Positive Samples: {pos_samples}"
+        f"Positive Samples: {pos_samples}, "
+        f"Avg Train Iter Time: {avg_train_iter_seconds:.4f}s, "
+        f"Train Phase Time: {train_phase_seconds:.2f}s, "
+        f"Valid Phase Time: {valid_phase_seconds:.2f}s, "
+        f"Epoch Time: {epoch_total_seconds:.2f}s"
     )
 
     with summary_writer.as_default():
@@ -693,6 +801,10 @@ for epoch in range(TRAIN_EPOCHS):
         tf.summary.scalar("validation_auc", validation_auc, step=epoch + 1)
         tf.summary.scalar("validation_accuracy", float(accuracy), step=epoch + 1)
         tf.summary.scalar("validation_recall_pos", float(recall_pos), step=epoch + 1)
+        tf.summary.scalar("avg_train_iter_sec", avg_train_iter_seconds, step=epoch + 1)
+        tf.summary.scalar("train_phase_sec", train_phase_seconds, step=epoch + 1)
+        tf.summary.scalar("valid_phase_sec", valid_phase_seconds, step=epoch + 1)
+        tf.summary.scalar("epoch_total_sec", epoch_total_seconds, step=epoch + 1)
 
     with open(metrics_csv_path, "a", newline="", encoding="utf-8") as fh:
         csv.writer(fh).writerow(
@@ -705,6 +817,10 @@ for epoch in range(TRAIN_EPOCHS):
                 f"{float(recall_pos):.6f}",
                 int(num_samples),
                 int(pos_samples),
+                f"{avg_train_iter_seconds:.6f}",
+                f"{train_phase_seconds:.6f}",
+                f"{valid_phase_seconds:.6f}",
+                f"{epoch_total_seconds:.6f}",
             ]
         )
 
