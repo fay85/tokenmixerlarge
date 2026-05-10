@@ -187,13 +187,54 @@ parser.add_argument(
 args = parser.parse_args()
 
 
+def _tf_version_tuple():
+    parts = []
+    for token in tf.__version__.split("."):
+        digits = ""
+        for ch in token:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if digits:
+            parts.append(int(digits))
+        else:
+            parts.append(0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3])
+
+
+_TF_VERSION = _tf_version_tuple()
+_LEGACY_TF = _TF_VERSION < (2, 7, 0)
+
+
 def _configure_precision_policy(precision: str):
+    """Resolve --precision to a Keras mixed-precision policy.
+
+    On TF < 2.7 the global "bfloat16" policy has a known interaction with
+    multi-input Keras Models that surfaces as ``make_shape`` receiving
+    ``[TensorShape([...])]`` during the build call. We auto-degrade to
+    ``mixed_bfloat16`` which keeps bf16 compute but uses fp32 master weights,
+    avoiding that build path while remaining numerically usable for training.
+    """
     if precision == "fp32":
         policy_name = "float32"
         model_dtype = tf.float32
     elif precision == "bf16":
-        policy_name = "bfloat16"
-        model_dtype = tf.bfloat16
+        if _LEGACY_TF:
+            policy_name = "mixed_bfloat16"
+            model_dtype = tf.bfloat16
+            print(
+                f"[precision] TF {tf.__version__} (<2.7) has a multi-input Keras "
+                f"build issue with global 'bfloat16' policy; degrading "
+                f"--precision bf16 to 'mixed_bfloat16' (bf16 compute, fp32 "
+                f"master weights). For pure bf16, upgrade TF to >= 2.7.",
+                file=sys.stderr,
+            )
+        else:
+            policy_name = "bfloat16"
+            model_dtype = tf.bfloat16
     elif precision == "mixed_bf16":
         policy_name = "mixed_bfloat16"
         model_dtype = tf.bfloat16
@@ -580,28 +621,55 @@ valid_dataset = get_dataset(
 )
 
 if MODEL_DTYPE != tf.float32:
-    logger.info(f"Casting dense features and labels to {MODEL_DTYPE.name} in tf.data pipeline")
+    if _LEGACY_TF:
+        logger.info(
+            f"TF {tf.__version__} (<2.7): skipping explicit dataset bf16 cast; "
+            f"Keras mixed-precision policy '{POLICY_NAME}' will auto-cast inputs "
+            f"to compute_dtype inside layers."
+        )
+    else:
+        logger.info(
+            f"Casting dense features and labels to {MODEL_DTYPE.name} in tf.data pipeline"
+        )
 
-    def _cast_batch_to_target_dtype(inputs, labels):
-        sparse_inputs, dense_inputs = inputs
-        return (
-            sparse_inputs,
-            tf.cast(dense_inputs, MODEL_DTYPE),
-        ), tf.cast(labels, LABEL_DTYPE)
+        def _cast_batch_to_target_dtype(inputs, labels):
+            sparse_inputs, dense_inputs = inputs
+            return (
+                sparse_inputs,
+                tf.cast(dense_inputs, MODEL_DTYPE),
+            ), tf.cast(labels, LABEL_DTYPE)
 
-    train_dataset = train_dataset.map(
-        _cast_batch_to_target_dtype, num_parallel_calls=tf.data.AUTOTUNE
-    )
-    valid_dataset = valid_dataset.map(
-        _cast_batch_to_target_dtype, num_parallel_calls=tf.data.AUTOTUNE
-    )
+        train_dataset = train_dataset.map(
+            _cast_batch_to_target_dtype, num_parallel_calls=tf.data.AUTOTUNE
+        )
+        valid_dataset = valid_dataset.map(
+            _cast_batch_to_target_dtype, num_parallel_calls=tf.data.AUTOTUNE
+        )
 
 ####################################################################################################
 #                                    BUILD MODEL & SEPARATE VARS                                   #
 ####################################################################################################
+_BUILD_DENSE_DTYPE = (
+    tf.float32 if tf.keras.mixed_precision.global_policy().variable_dtype == "float32"
+    else MODEL_DTYPE
+)
 dummy_sparse = tf.zeros((1, NUM_CAT_FEATURES), dtype=tf.int32)
-dummy_dense = tf.zeros((1, NUM_DENSE_FEATURES), dtype=MODEL_DTYPE)
-_ = model((dummy_sparse, dummy_dense))
+dummy_dense = tf.zeros((1, NUM_DENSE_FEATURES), dtype=_BUILD_DENSE_DTYPE)
+
+if _LEGACY_TF:
+    logger.info(
+        f"TF {tf.__version__} (<2.7): building model via model.call(...) to bypass "
+        f"Layer.__call__'s nested-tuple input bookkeeping (avoids "
+        f"'make_shape got [TensorShape(...)]' in older TF)."
+    )
+    _ = model.call((dummy_sparse, dummy_dense), training=False)
+    # TF 2.6 Keras Model._assert_weights_created() requires self.built==True when
+    # the subclass defines build(); model.call(...) does not flip that flag, so
+    # set it explicitly. Sublayers were already built via their own __call__
+    # inside model.call(), so model.trainable_variables is now populated.
+    model.built = True
+else:
+    _ = model((dummy_sparse, dummy_dense))
 
 embedding_parameters = []
 other_parameters = []
@@ -744,7 +812,12 @@ for epoch in range(TRAIN_EPOCHS):
         if args.max_train_batches is not None and batch_idx >= args.max_train_batches:
             break
         iter_start_time = time.perf_counter()
-        labels = tf.cast(labels, LABEL_DTYPE)
+        # Do NOT pre-cast labels to LABEL_DTYPE here. The MUSA plugin's _Arg
+        # kernel is only registered for {float, double, half, int32, int64,
+        # bool, resource}; passing bfloat16 labels into the @tf.function would
+        # require _Arg(bfloat16). The cast lives inside train_step (where it is
+        # a regular Cast op that MUSA does support for all dtypes), so labels
+        # cross the function boundary as their natural int32 dtype.
 
         loss = train_step(inputs, labels)
         train_iter_time_total += time.perf_counter() - iter_start_time
