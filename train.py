@@ -1,13 +1,56 @@
 import argparse
+import os
+import sys
+
+# ----------------------------------------------------------------------------
+# Early MUSA device selection — must happen BEFORE `import tensorflow as tf`.
+#
+# tf.config.set_visible_devices(...) only works when called before any TF
+# device context has been initialized. tf.load_library / tf.load_op_library
+# (which we need to pull in the MUSA plugin and its custom ops below) both
+# touch the device, so by the time _configure_musa_physical_devices() calls
+# set_visible_devices() it is too late — TF has already bound to whichever
+# physical card the driver enumerated first (typically index 0). When index 0
+# is busy on a shared host this manifests as an OOM at model build despite
+# passing --musa_device_index N for some other N.
+#
+# We side-step the ordering problem by setting MUSA_VISIBLE_DEVICES in
+# os.environ now, before any TF call. The MUSA driver then only ever shows TF
+# one physical device, no in-Python re-routing is required, and the OOM-prone
+# busy device is invisible to this process entirely.
+#
+# A pre-existing MUSA_VISIBLE_DEVICES in the environment always wins, so a
+# container that already limits visibility (or a user who set the variable in
+# their shell) is not overridden.
+# ----------------------------------------------------------------------------
+_pre_parser = argparse.ArgumentParser(add_help=False)
+_pre_parser.add_argument("--backend", default="cuda")
+_pre_parser.add_argument("--musa_device_index", type=int, default=0)
+_pre_parser.add_argument("--all_musa_devices", action="store_true")
+_pre_args, _ = _pre_parser.parse_known_args()
+if _pre_args.backend == "musa" and not _pre_args.all_musa_devices:
+    if "MUSA_VISIBLE_DEVICES" not in os.environ:
+        os.environ["MUSA_VISIBLE_DEVICES"] = str(_pre_args.musa_device_index)
+        print(
+            f"[musa] set MUSA_VISIBLE_DEVICES={_pre_args.musa_device_index} "
+            f"from --musa_device_index (before TF import).",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"[musa] MUSA_VISIBLE_DEVICES already set to "
+            f"'{os.environ['MUSA_VISIBLE_DEVICES']}' in the environment; "
+            f"--musa_device_index ignored.",
+            file=sys.stderr,
+        )
+
 import csv
 import time
 import tensorflow as tf
 import numpy as np
 import random
 import logging
-import sys
 from datetime import datetime
-import os
 import shutil
 
 parser = argparse.ArgumentParser(description="Train TokenMixer-Large with TensorFlow MUSA Extension")
@@ -184,6 +227,15 @@ parser.add_argument(
     help="MUSA only: expose every MUSA accelerator to TensorFlow (default: hide all but one — "
     "training is still single-device unless you add a distribution strategy).",
 )
+parser.add_argument(
+    "--disable_musa_mixed_adam",
+    action="store_true",
+    default=False,
+    help="MUSA only: disable the mixed-precision Adam fast path that routes "
+    "bf16/fp16 gradients through MusaResourceApplyAdamMixed with fp32 state. "
+    "Set this only for A/B comparisons against the legacy Cast+ResourceApplyAdam "
+    "path; it has no effect on --backend cuda or --precision fp32.",
+)
 args = parser.parse_args()
 
 
@@ -245,12 +297,34 @@ def _configure_precision_policy(precision: str):
 
 
 def _configure_musa_physical_devices(expose_all: bool, device_index: int) -> None:
-    """Train loop is single-device; TF still enumerates every card unless we hide them."""
+    """Train loop is single-device; TF still enumerates every card unless we hide them.
+
+    Even with MUSA_VISIBLE_DEVICES already set in the environment (which is
+    the only fully reliable way to pin TF to a specific physical card on a
+    shared host), we still run this for diagnostics: it prints exactly what
+    TF sees post-import, so a mis-pinned process is obvious from the log
+    instead of hidden behind a generic OOM later.
+    """
     try:
         physical = tf.config.list_physical_devices("MUSA")
     except (ValueError, TypeError):
         physical = []
+
+    musa_visible_env = os.environ.get("MUSA_VISIBLE_DEVICES", "<unset>")
+    print(
+        f"[musa] MUSA_VISIBLE_DEVICES={musa_visible_env}, "
+        f"tf.list_physical_devices('MUSA') -> {len(physical)} device(s): "
+        f"{[p.name for p in physical]}",
+        file=sys.stderr,
+    )
+
     if not physical:
+        print(
+            "[musa] WARNING: TensorFlow sees zero MUSA devices. Check that "
+            "the plugin loaded successfully and that MUSA_VISIBLE_DEVICES is "
+            "not filtered to a non-existent index.",
+            file=sys.stderr,
+        )
         return
     if expose_all:
         print(
@@ -265,7 +339,11 @@ def _configure_musa_physical_devices(expose_all: bool, device_index: int) -> Non
     except (RuntimeError, ValueError, TypeError) as exc:
         print(
             f"[musa] Could not set_visible_devices to index {idx}: {exc}. "
-            "Try exporting MUSA_VISIBLE_DEVICES before starting Python.",
+            "This is normally fine when MUSA_VISIBLE_DEVICES is already set "
+            "in the environment (the driver has already filtered devices, so "
+            "TF is bound to the right physical card regardless of this "
+            "failure). If MUSA_VISIBLE_DEVICES is unset, TF will run on "
+            "whichever device the driver enumerated first.",
             file=sys.stderr,
         )
         return
@@ -275,10 +353,28 @@ def _configure_musa_physical_devices(expose_all: bool, device_index: int) -> Non
     )
 
 
+_MUSA_OP_MODULE = None
 if args.backend == "musa":
     if args.lib_path is None:
         raise ValueError("--lib_path is required when --backend musa")
     tf.load_library(args.lib_path)
+    # tf.load_library registers the MUSA device + kernels but does NOT make
+    # plugin-defined custom ops (e.g. MusaResourceApplyAdamMixed) accessible
+    # from Python: tf.raw_ops only contains ops baked into the TF wheel at
+    # build time, so plugin ops never appear there even when they are fully
+    # registered in the C++ op registry. tf.load_op_library on the same path
+    # re-uses the dlopen cache (no double registration) and returns a Python
+    # module whose attributes ARE the generated wrappers for those ops.
+    try:
+        _MUSA_OP_MODULE = tf.load_op_library(args.lib_path)
+    except Exception as _exc:  # pragma: no cover - depends on plugin contents
+        print(
+            f"[musa] tf.load_op_library({args.lib_path}) failed: {_exc}. "
+            f"Custom MUSA ops (e.g. MusaResourceApplyAdamMixed) will be "
+            f"unavailable from Python and the mixed Adam fast path will "
+            f"silently fall back to the stock Cast+Adam path.",
+            file=sys.stderr,
+        )
     _configure_musa_physical_devices(args.all_musa_devices, args.musa_device_index)
 
 if args.backend == "cuda":
@@ -584,7 +680,149 @@ logger.info(
     f"warmup_steps={WARMUP_STEPS} total_steps={TOTAL_TRAIN_STEPS} min_lr={args.min_lr}"
 )
 embedding_optimizer = tf.keras.optimizers.SGD(learning_rate=lr_schedule)
-other_optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+
+
+def _is_musa_mixed_adam_available() -> bool:
+    """True if the MUSA plugin exposed musa_resource_apply_adam_mixed.
+
+    The op is registered at plugin load time via REGISTER_OP inside the .so
+    the user passed to --lib_path, but ``tf.raw_ops`` is a static module
+    baked into the TF wheel and never sees plugin ops. We look up the op via
+    the module that ``tf.load_op_library`` returned instead (loaded right
+    after ``tf.load_library`` above; same dlopen handle, just exposes the
+    auto-generated Python wrappers).
+    """
+    return (_MUSA_OP_MODULE is not None
+            and hasattr(_MUSA_OP_MODULE, "musa_resource_apply_adam_mixed"))
+
+
+def _make_musa_adam_class():
+    """Build a Keras Adam subclass that dispatches to MusaResourceApplyAdamMixed.
+
+    The mixed op accepts fp32 master state (``var``/``m``/``v``) and a bf16,
+    fp16, or fp32 gradient. Promotion happens inside the kernel with RNE
+    rounding, so the math is bit-equivalent to running stock Adam after an
+    explicit fp32 cast — except no fp32 gradient tensor is materialized on
+    device, saving one gradient-sized memory pass per parameter per step.
+
+    Falls back to the parent implementation when AMSGrad is on (no mixed
+    AMSGrad op yet), when the variable isn't on a MUSA device, when the
+    variable isn't fp32 (proper mixed precision keeps master weights in
+    fp32), or when the gradient dtype is unexpected.
+    """
+
+    class MusaAdam(tf.keras.optimizers.Adam):
+        _LOWP_GRAD_DTYPES = (tf.float32, tf.bfloat16, tf.float16)
+
+        def __init__(self, *opt_args, **opt_kwargs):
+            super().__init__(*opt_args, **opt_kwargs)
+            self._musa_amsgrad_warned = False
+            self._musa_var_dtype_warned = False
+
+        def _resource_apply_dense(self, grad, var, apply_state=None):
+            if self.amsgrad:
+                if not self._musa_amsgrad_warned:
+                    logger.info(
+                        "MusaAdam: AMSGrad enabled, falling back to stock Adam "
+                        "apply path. Disable AMSGrad to use the MUSA mixed-"
+                        "precision fast path."
+                    )
+                    self._musa_amsgrad_warned = True
+                return super()._resource_apply_dense(grad, var, apply_state)
+
+            var_device = var.device or ""
+            if "MUSA" not in var_device:
+                return super()._resource_apply_dense(grad, var, apply_state)
+
+            if var.dtype.base_dtype != tf.float32:
+                if not self._musa_var_dtype_warned:
+                    logger.warning(
+                        "MusaAdam: variable %s has dtype %s but the mixed Adam "
+                        "fast path requires fp32 master weights. Falling back "
+                        "to the stock (possibly bf16-state) Adam path, which "
+                        "loses precision between iterations. Switch to "
+                        "--precision mixed_bf16 (fp32 weights, bf16 compute) "
+                        "to take the fast path.",
+                        var.name,
+                        var.dtype,
+                    )
+                    self._musa_var_dtype_warned = True
+                return super()._resource_apply_dense(grad, var, apply_state)
+
+            if grad.dtype not in self._LOWP_GRAD_DTYPES:
+                return super()._resource_apply_dense(grad, var, apply_state)
+
+            var_dtype = var.dtype.base_dtype
+            coefficients = (
+                (apply_state or {}).get((var_device, var_dtype))
+                or self._fallback_apply_state(var_device, var_dtype)
+            )
+            m = self.get_slot(var, "m")
+            v = self.get_slot(var, "v")
+
+            def _f32(value):
+                if isinstance(value, tf.Tensor) and value.dtype == tf.float32:
+                    return value
+                return tf.cast(value, tf.float32)
+
+            return _MUSA_OP_MODULE.musa_resource_apply_adam_mixed(
+                var=var.handle,
+                m=m.handle,
+                v=v.handle,
+                beta1_power=_f32(coefficients["beta_1_power"]),
+                beta2_power=_f32(coefficients["beta_2_power"]),
+                lr=_f32(coefficients["lr_t"]),
+                beta1=_f32(coefficients["beta_1_t"]),
+                beta2=_f32(coefficients["beta_2_t"]),
+                epsilon=_f32(coefficients["epsilon"]),
+                grad=grad,
+                use_locking=self._use_locking,
+                use_nesterov=False,
+            )
+
+    return MusaAdam
+
+
+_on_musa = (args.backend == "musa")
+_is_low_precision_run = args.precision in ("bf16", "mixed_bf16")
+_musa_mixed_adam_supported = _is_musa_mixed_adam_available()
+_use_musa_mixed_adam = (
+    _on_musa
+    and _is_low_precision_run
+    and _musa_mixed_adam_supported
+    and not args.disable_musa_mixed_adam
+)
+
+if _use_musa_mixed_adam:
+    MusaAdam = _make_musa_adam_class()
+    other_optimizer = MusaAdam(learning_rate=lr_schedule)
+    logger.info(
+        "Using MusaAdam (fp32 state, bf16/fp16 grad consumed directly by "
+        "MusaResourceApplyAdamMixed; no Cast(bf16->fp32) materialized)."
+    )
+else:
+    other_optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+    if _on_musa and _is_low_precision_run and not _musa_mixed_adam_supported:
+        logger.warning(
+            "MusaResourceApplyAdamMixed not found in the loaded plugin "
+            "(the .so at --lib_path does not expose "
+            "musa_resource_apply_adam_mixed). The stock Adam path with an "
+            "explicit Cast(bf16->fp32) will be used instead. Rebuild the "
+            "plugin from a revision that includes the mixed-precision Adam "
+            "op (verify with: nm -D <plugin.so> | grep -i AdamMixed)."
+        )
+    elif _on_musa and _is_low_precision_run and args.disable_musa_mixed_adam:
+        logger.info(
+            "MUSA mixed Adam is supported but disabled by "
+            "--disable_musa_mixed_adam; using stock Adam."
+        )
+    else:
+        logger.info(
+            "Using stock tf.keras.optimizers.Adam (mixed Adam path doesn't "
+            "apply for backend=%s precision=%s).",
+            args.backend,
+            args.precision,
+        )
 
 
 def binary_cross_entropy_with_logits(labels, logits):
