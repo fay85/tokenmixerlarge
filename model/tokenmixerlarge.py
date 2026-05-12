@@ -426,9 +426,22 @@ class TokenMixerLarge(tf.keras.Model):
 
     def build(self, input_shape):
         # All variables are created lazily on the first call(); this stub
-        # keeps Keras 3 from logging "build() was called on layer ... however
+        # keeps Keras from logging "build() was called on layer ... however
         # the layer does not have a build() method implemented" warnings.
-        super().build(input_shape)
+        #
+        # NOTE: Keras 2.13+ tightened tf.keras.Model.build() and it no longer
+        # accepts a nested input_shape (a tuple / list of TensorShapes) the
+        # way Keras 2.6 - 2.10 did.  Because our call() signature is
+        #     call(self, inputs, ...)   with   inputs = (sparse, dense)
+        # the framework passes input_shape as a 2-tuple of TensorShapes, which
+        # the new super().build() tries to convert into a single TensorShape
+        # and throws:
+        #   TypeError: Error converting shape to a TensorShape: Dimension
+        #   value must be integer or None or have an __index__ method, got
+        #   value 'TensorShape([1, 26])' with type 'TensorShape'.
+        # Skip super() entirely; setting self.built = True is the
+        # documented pattern for lazily-built models.
+        self.built = True
 
     def call(self, inputs, training=False, return_aux=False):
         sparse_inputs, dense_inputs = inputs
