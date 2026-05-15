@@ -44,6 +44,7 @@ if _pre_args.backend == "musa" and not _pre_args.all_musa_devices:
             file=sys.stderr,
         )
 
+import atexit
 import csv
 import time
 import tensorflow as tf
@@ -235,6 +236,48 @@ parser.add_argument(
     "bf16/fp16 gradients through MusaResourceApplyAdamMixed with fp32 state. "
     "Set this only for A/B comparisons against the legacy Cast+ResourceApplyAdam "
     "path; it has no effect on --backend cuda or --precision fp32.",
+)
+# ---- TensorBoard profiler --------------------------------------------------
+# When --profile is set the script captures a window of training steps with
+# tf.profiler.experimental.start/stop and writes the resulting XSpace into
+# the run's tensorboard subdirectory. The same TensorBoard --logdir that
+# shows the per-step scalars below will then expose a "Profile" tab with
+# host CPU + device (GPU / MUSA) timelines, GPU kernel stats, op stats and
+# input-pipeline analysis. On --backend musa the device side is populated
+# by the plugin's MUPTI-based ProfilerInterface (registered automatically
+# from libmusa_plugin.so's plugin-load constructor); on --backend cuda it
+# comes from TF's bundled CUPTI tracer. Either way the user-visible API is
+# the same, so nothing about the rest of the script changes.
+parser.add_argument(
+    "--profile",
+    action="store_true",
+    default=False,
+    help="Capture a TensorBoard profile of a few training steps. The trace "
+    "is written to logs/<timestamp>/tensorboard/, alongside the scalar "
+    "summaries, so a single `tensorboard --logdir logs/<ts>` shows both.",
+)
+parser.add_argument(
+    "--profile_start_step",
+    type=int,
+    default=50,
+    help="Global step index (0-based) at which to begin profiling. Defaults "
+    "to 50 to skip the @tf.function trace-compile cost and warmup transients.",
+)
+parser.add_argument(
+    "--profile_steps",
+    type=int,
+    default=20,
+    help="Number of training steps to capture before automatically stopping "
+    "the profiler. 10-30 is usually plenty; longer windows produce trace "
+    "files large enough to slow the TensorBoard profile loader.",
+)
+parser.add_argument(
+    "--profile_python",
+    action="store_true",
+    default=False,
+    help="Include Python function frames in the host trace (slower, more "
+    "verbose). Off by default; TF op spans alone are enough to see what "
+    "is feeding the device.",
 )
 args = parser.parse_args()
 
@@ -461,7 +504,148 @@ if args.backend == "musa":
         f"musa_device_index={args.musa_device_index}, all_musa_devices={args.all_musa_devices}"
     )
 
-summary_writer = tf.summary.create_file_writer(f"logs/{formatted_time}/tensorboard")
+tensorboard_logdir = f"logs/{formatted_time}/tensorboard"
+summary_writer = tf.summary.create_file_writer(tensorboard_logdir)
+
+
+####################################################################################################
+#                                   TENSORBOARD PROFILER                                          #
+####################################################################################################
+# Everything here is a no-op when --profile is not set; the cost of the
+# `with` scope below in that case is one Python attribute read per step.
+class _ProfileController:
+    """RAII-style wrapper around tf.profiler.experimental.{start,stop}.
+
+    The profiler is a global, process-wide service: only one session can be
+    active per process, and TF will raise if start() is called twice without
+    a stop(). We track activity locally so that double-start (e.g. on
+    accidental flag reuse) is a clear log warning instead of a hard crash,
+    and so we can guarantee Stop() runs even when the training loop exits
+    early through an exception.
+    """
+
+    def __init__(self, enabled: bool, logdir: str, start_step: int,
+                 num_steps: int, capture_python: bool) -> None:
+        self.enabled = enabled
+        self.logdir = logdir
+        self.start_step = start_step
+        self.num_steps = max(0, int(num_steps))
+        self.stop_step = start_step + self.num_steps
+        self.capture_python = capture_python
+        self.active = False
+
+    def _build_options(self):
+        # ProfilerOptions appeared in tf 2.3; older builds silently accept
+        # only (logdir,). We fall back to the bare call if the symbol or
+        # any field is missing on this TF version.
+        options_cls = getattr(
+            getattr(tf, "profiler", None), "experimental", None
+        )
+        options_cls = getattr(options_cls, "ProfilerOptions", None)
+        if options_cls is None:
+            return None
+        try:
+            return options_cls(
+                host_tracer_level=2,
+                python_tracer_level=1 if self.capture_python else 0,
+                device_tracer_level=1,
+            )
+        except TypeError:
+            # Some early TF 2.x versions only support host_tracer_level.
+            try:
+                return options_cls(host_tracer_level=2)
+            except TypeError:
+                return None
+
+    def maybe_start(self, step: int) -> None:
+        if not self.enabled or self.active or step != self.start_step:
+            return
+        if self.num_steps <= 0:
+            logger.warning("[profiler] --profile_steps <= 0, skipping capture")
+            return
+        opts = self._build_options()
+        try:
+            if opts is not None:
+                tf.profiler.experimental.start(self.logdir, options=opts)
+            else:
+                tf.profiler.experimental.start(self.logdir)
+        except (RuntimeError, AttributeError) as exc:
+            logger.warning(
+                "[profiler] tf.profiler.experimental.start(%s) failed: %s. "
+                "Skipping profile capture. (Check tf.__version__ and that "
+                "no other profiler session is already running in this "
+                "process.)", self.logdir, exc,
+            )
+            return
+        self.active = True
+        logger.info(
+            "[profiler] started at step %d, will stop at step %d. "
+            "Trace will appear in %s/plugins/profile/.",
+            self.start_step, self.stop_step, self.logdir,
+        )
+
+    def maybe_stop(self, step: int) -> None:
+        if not self.active or step < self.stop_step:
+            return
+        try:
+            tf.profiler.experimental.stop()
+        except (RuntimeError, AttributeError) as exc:
+            logger.warning(
+                "[profiler] tf.profiler.experimental.stop() failed: %s",
+                exc,
+            )
+        finally:
+            self.active = False
+        logger.info(
+            "[profiler] stopped at step %d. Inspect with: "
+            "tensorboard --logdir %s   (open the 'Profile' tab)",
+            step, os.path.dirname(self.logdir),
+        )
+
+    def force_stop(self) -> None:
+        if self.active:
+            try:
+                tf.profiler.experimental.stop()
+            except (RuntimeError, AttributeError) as exc:
+                logger.warning(
+                    "[profiler] force-stop failed: %s", exc,
+                )
+            finally:
+                self.active = False
+
+
+profile_controller = _ProfileController(
+    enabled=bool(args.profile),
+    logdir=tensorboard_logdir,
+    start_step=int(args.profile_start_step),
+    num_steps=int(args.profile_steps),
+    capture_python=bool(args.profile_python),
+)
+# Belt-and-suspenders flush: if the script exits before the training loop
+# naturally hits stop_step (small --max_train_batches, a Ctrl-C, an early
+# error inside train_step, etc.) we still want the partial trace on disk
+# instead of buffered inside the dying process.
+atexit.register(profile_controller.force_stop)
+
+if args.profile:
+    if args.max_train_batches is not None and (
+        args.max_train_batches < profile_controller.stop_step
+    ):
+        logger.warning(
+            "[profiler] --max_train_batches=%d ends before "
+            "--profile_start_step + --profile_steps = %d. The trace will "
+            "be truncated; bump --max_train_batches or lower the start/"
+            "duration to capture the full window.",
+            args.max_train_batches, profile_controller.stop_step,
+        )
+    logger.info(
+        "[profiler] enabled (backend=%s, start_step=%d, num_steps=%d, "
+        "python_frames=%s). Host CPU spans come from TensorFlow's executor; "
+        "device kernels come from %s.",
+        args.backend, profile_controller.start_step,
+        profile_controller.num_steps, profile_controller.capture_python,
+        "MUPTI via the MUSA plugin" if args.backend == "musa" else "CUPTI",
+    )
 shutil.copy(
     src=__file__,
     dst=f"logs/{formatted_time}/",
@@ -1049,6 +1233,15 @@ for epoch in range(TRAIN_EPOCHS):
     for batch_idx, (inputs, labels) in enumerate(train_dataset):
         if args.max_train_batches is not None and batch_idx >= args.max_train_batches:
             break
+
+        # Profiler window control. maybe_start / maybe_stop are cheap when
+        # --profile is off (a single integer compare + bool check).  When
+        # on, they call tf.profiler.experimental.start at exactly the
+        # configured step and stop after the requested number of steps so
+        # the trace covers a clean, warmed-up region of training.
+        profile_controller.maybe_start(step)
+        profile_controller.maybe_stop(step)
+
         iter_start_time = time.perf_counter()
         # Do NOT pre-cast labels to LABEL_DTYPE here. The MUSA plugin's _Arg
         # kernel is only registered for {float, double, half, int32, int64,
@@ -1057,7 +1250,15 @@ for epoch in range(TRAIN_EPOCHS):
         # a regular Cast op that MUSA does support for all dtypes), so labels
         # cross the function boundary as their natural int32 dtype.
 
-        loss = train_step(inputs, labels)
+        # The Trace scope tags the host-side step boundary so TensorBoard's
+        # "Step time" view can split per-step phases. step_num=step makes
+        # the trace viewer label each scope "train_step <N>" and groups
+        # device kernels under the matching host span via timestamp overlap
+        # (and via correlation IDs when the device tracer supplies them).
+        with tf.profiler.experimental.Trace(
+            "train_step", step_num=step, _r=1
+        ):
+            loss = train_step(inputs, labels)
         train_iter_time_total += time.perf_counter() - iter_start_time
         train_iter_count += 1
         loss_fp32 = tf.cast(loss, tf.float32)
@@ -1139,6 +1340,13 @@ for epoch in range(TRAIN_EPOCHS):
         ckpt_path = os.path.join(checkpoint_dir, f"tokenmixerlarge_epoch_{epoch+1}")
         model.save_weights(ckpt_path)
         logger.info(f"Model checkpoint saved for epoch {epoch+1} at {ckpt_path}")
+
+
+# Final clean profiler shutdown. If maybe_stop already ran at stop_step
+# this is a no-op; if training ended before stop_step was reached (e.g.
+# --max_train_batches truncated it) we still emit a trace covering as
+# many steps as were actually executed.
+profile_controller.force_stop()
 
 
 ####################################################################################################
