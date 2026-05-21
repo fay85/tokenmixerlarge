@@ -45,6 +45,7 @@ if _pre_args.backend == "musa" and not _pre_args.all_musa_devices:
         )
 
 import atexit
+import ctypes
 import csv
 import time
 import tensorflow as tf
@@ -103,7 +104,9 @@ parser.add_argument(
     "--disable_tf32",
     action="store_true",
     default=False,
-    help="Disable TensorFloat-32 kernels when available (recommended for cross-backend alignment).",
+    help="Disable TF32 compute for FP32 MatMul/Conv: sets MUSA_ENABLE_TF32=0 before "
+    "loading the MUSA plugin (legacy and pluggable) and calls "
+    "tf.config.experimental.enable_tensor_float_32_execution(False) on CUDA.",
 )
 parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
 parser.add_argument("--batch_size", type=int, default=4096, help="Training/eval batch size")
@@ -236,6 +239,49 @@ parser.add_argument(
     "bf16/fp16 gradients through MusaResourceApplyAdamMixed with fp32 state. "
     "Set this only for A/B comparisons against the legacy Cast+ResourceApplyAdam "
     "path; it has no effect on --backend cuda or --precision fp32.",
+)
+parser.add_argument(
+    "--musa_legacy_device",
+    action="store_true",
+    default=False,
+    help="MUSA only: load libmusa_plugin.so with the legacy MusaDevice factory "
+    "(TENSORFLOW_MUSA_USE_LEGACY_DEVICE=1). Use with legacy-tight-coupled builds. "
+    "Default (unset) uses PluggableDevice via load_pluggable_device_library "
+    "(SE_InitPlugin), required for pluggable-flavor wheels.",
+)
+parser.add_argument(
+    "--disable_musa_grappler",
+    action="store_true",
+    default=False,
+    help="MUSA only: set MUSA_DISABLE_GRAPPLER=1 before loading the plugin to skip "
+    "musa_graph_optimizer fusion/layout passes (A/B for accuracy vs fused graphs).",
+)
+parser.add_argument(
+    "--dump_musa_graph",
+    action="store_true",
+    default=False,
+    help="MUSA only: enable musa_graph_optimizer GraphDef dumps (.pb under "
+    "--musa_graph_dump_dir). Requires musa_graph_optimizer on the process "
+    "ConfigProto (configured automatically for --backend musa).",
+)
+parser.add_argument(
+    "--musa_graph_dump_dir",
+    type=str,
+    default=None,
+    help="Directory for MUSA Grappler GraphDef dumps. Default: "
+    "logs/<run_timestamp>/musa_graphs when --dump_musa_graph is set.",
+)
+parser.add_argument(
+    "--musa_graph_dump_text",
+    action="store_true",
+    default=False,
+    help="Also write human-readable .pbtxt GraphDef dumps (MUSA_DUMP_GRAPHDEF_TEXT=1).",
+)
+parser.add_argument(
+    "--musa_graph_dump_slim",
+    action="store_true",
+    default=False,
+    help="Also write trimmed .slim.pb GraphDef dumps (MUSA_DUMP_GRAPHDEF_SLIM=1).",
 )
 # ---- TensorBoard profiler --------------------------------------------------
 # When --profile is set the script captures a window of training steps with
@@ -396,28 +442,230 @@ def _configure_musa_physical_devices(expose_all: bool, device_index: int) -> Non
     )
 
 
+_MUSA_GRAPH_OPTIMIZER_NAME = "musa_graph_optimizer"
+
+
+def _configure_musa_grappler_process(enable_optimizer: bool) -> None:
+    """Register musa_graph_optimizer on the process-wide TF ConfigProto.
+
+    Without this, REGISTER_GRAPH_OPTIMIZER_AS in libmusa_plugin.so is never
+    invoked during @tf.function tracing and GraphDef dumps / fusion do not run.
+    """
+    from tensorflow.python.eager import context
+
+    cfg = context.context().config
+    rewrite_options = cfg.graph_options.rewrite_options
+    rewrite_options.min_graph_nodes = -1
+
+    if not enable_optimizer:
+        kept_custom = [
+            entry
+            for entry in rewrite_options.custom_optimizers
+            if entry.name != _MUSA_GRAPH_OPTIMIZER_NAME
+        ]
+        del rewrite_options.custom_optimizers[:]
+        for entry in kept_custom:
+            rewrite_options.custom_optimizers.add().CopyFrom(entry)
+        rewrite_options.optimizers[:] = [
+            name
+            for name in rewrite_options.optimizers
+            if name != _MUSA_GRAPH_OPTIMIZER_NAME
+        ]
+        print(
+            "[musa] musa_graph_optimizer removed from process ConfigProto.",
+            file=sys.stderr,
+        )
+        return
+
+    has_custom = any(
+        entry.name == _MUSA_GRAPH_OPTIMIZER_NAME
+        for entry in rewrite_options.custom_optimizers
+    )
+    if not has_custom:
+        custom = rewrite_options.custom_optimizers.add()
+        custom.name = _MUSA_GRAPH_OPTIMIZER_NAME
+
+    optimizer_names = list(rewrite_options.optimizers)
+    if _MUSA_GRAPH_OPTIMIZER_NAME not in optimizer_names:
+        rewrite_options.optimizers.extend([_MUSA_GRAPH_OPTIMIZER_NAME])
+
+    print(
+        "[musa] musa_graph_optimizer enabled on process ConfigProto "
+        f"(custom_optimizers={list(rewrite_options.custom_optimizers)}, "
+        f"optimizers={list(rewrite_options.optimizers)}).",
+        file=sys.stderr,
+    )
+
+
+def _enable_musa_graph_dump(
+    lib_path: str,
+    dump_dir: str,
+    dump_text: bool = False,
+    dump_slim: bool = False,
+) -> None:
+    """Enable GraphDef dumping inside musa_graph_optimizer (not per-op kernels)."""
+    os.makedirs(dump_dir, exist_ok=True)
+    os.environ["MUSA_DUMP_GRAPHDEF"] = "1"
+    os.environ["MUSA_DUMP_GRAPHDEF_DIR"] = dump_dir
+    if dump_text:
+        os.environ["MUSA_DUMP_GRAPHDEF_TEXT"] = "1"
+    if dump_slim:
+        os.environ["MUSA_DUMP_GRAPHDEF_SLIM"] = "1"
+
+    try:
+        lib = ctypes.CDLL(os.path.abspath(lib_path))
+        set_dump = getattr(lib, "TFMusaSetGraphDumpConfig", None)
+        if set_dump is not None:
+            set_dump.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+            set_dump.restype = None
+            set_dump(
+                1,
+                os.path.abspath(dump_dir).encode("utf-8"),
+                int(dump_text),
+                int(dump_slim),
+            )
+    except OSError as exc:
+        print(
+            f"[musa] TFMusaSetGraphDumpConfig unavailable ({exc}); "
+            "using MUSA_DUMP_GRAPHDEF* environment variables only.",
+            file=sys.stderr,
+        )
+
+    print(
+        f"[musa] GraphDef dump enabled -> {os.path.abspath(dump_dir)} "
+        f"(text={dump_text}, slim={dump_slim}).",
+        file=sys.stderr,
+    )
+
+
+def _load_musa_plugin(lib_path: str, use_legacy_device: bool):
+    """Load libmusa_plugin.so the same way tensorflow_musa does.
+
+    tf.load_library alone registers kernels but pluggable-flavor builds also need
+    load_pluggable_device_library() (SE_InitPlugin) to expose /device:MUSA:*.
+    Legacy builds use REGISTER_LOCAL_DEVICE_FACTORY and only need tf.load_library.
+    """
+    if use_legacy_device:
+        os.environ["TENSORFLOW_MUSA_USE_LEGACY_DEVICE"] = "1"
+
+    tf.load_library(lib_path)
+
+    op_module = None
+    try:
+        op_module = tf.load_op_library(lib_path)
+    except Exception as exc:
+        print(
+            f"[musa] tf.load_op_library({lib_path}) failed: {exc}. "
+            "Custom MUSA ops (e.g. MusaResourceApplyAdamMixed) will be "
+            "unavailable from Python and the mixed Adam fast path will "
+            "silently fall back to the stock Cast+Adam path.",
+            file=sys.stderr,
+        )
+
+    legacy_mode = os.environ.get("TENSORFLOW_MUSA_USE_LEGACY_DEVICE") == "1"
+    if legacy_mode:
+        print(
+            "[musa] Plugin load mode: legacy MusaDevice "
+            "(TENSORFLOW_MUSA_USE_LEGACY_DEVICE=1).",
+            file=sys.stderr,
+        )
+    else:
+        try:
+            from tensorflow.python.framework.load_library import (
+                load_pluggable_device_library,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "TensorFlow does not expose load_pluggable_device_library; "
+                "install a TF 2.10+ wheel or pass --musa_legacy_device for "
+                "legacy-tight-coupled libmusa_plugin.so builds."
+            ) from exc
+        try:
+            load_pluggable_device_library(lib_path)
+        except Exception as exc:
+            raise RuntimeError(
+                f"load_pluggable_device_library({lib_path}) failed: {exc}. "
+                "Pluggable MUSA builds require this call (same as import tensorflow_musa)."
+            ) from exc
+        print(
+            "[musa] Plugin load mode: PluggableDevice "
+            "(load_pluggable_device_library / SE_InitPlugin).",
+            file=sys.stderr,
+        )
+
+    return op_module
+
+
+def _log_musa_runtime_config(lib_path: str, use_legacy_device: bool) -> None:
+    """Log effective MUSA env and TF device enumeration to the training log."""
+    legacy_mode = (
+        use_legacy_device
+        or os.environ.get("TENSORFLOW_MUSA_USE_LEGACY_DEVICE") == "1"
+    )
+    logger.info(
+        "musa_plugin_path=%s, device_mode=%s",
+        lib_path,
+        "legacy" if legacy_mode else "pluggable",
+    )
+    for key in (
+        "MUSA_VISIBLE_DEVICES",
+        "TENSORFLOW_MUSA_USE_LEGACY_DEVICE",
+        "MUSA_ENABLE_TF32",
+        "MUSA_DISABLE_GRAPPLER",
+        "MUSA_MUL_ENABLE_CUSTOM_KERNEL",
+        "MUSA_DISABLE_ADAM_BF16",
+        "MUSA_SE_SYNC_H2D",
+        "MUSA_SE_SYNC_STREAM_DEPENDENCY",
+        "MUSA_AUTO_MIXED_PRECISION",
+        "MUSA_DUMP_GRAPHDEF",
+    ):
+        logger.info("musa_env %s=%s", key, os.environ.get(key, "<unset>"))
+    try:
+        physical = tf.config.list_physical_devices("MUSA")
+    except (ValueError, TypeError):
+        physical = []
+    logger.info(
+        "tf.list_physical_devices('MUSA') -> %d device(s): %s",
+        len(physical),
+        [p.name for p in physical],
+    )
+    if not physical:
+        logger.warning(
+            "TensorFlow sees zero MUSA devices after plugin load. "
+            "For pluggable builds, confirm load_pluggable_device_library ran "
+            "without error. For legacy builds, use --musa_legacy_device."
+        )
+
+
+if args.disable_tf32:
+    # MUSA kernels read MUSA_ENABLE_TF32 once at first MatMul/Conv construction;
+    # it must be set before tf.load_library / tf.load_op_library.
+    os.environ["MUSA_ENABLE_TF32"] = "0"
+    set_tf32 = getattr(tf.config.experimental, "enable_tensor_float_32_execution", None)
+    if callable(set_tf32):
+        try:
+            set_tf32(False)
+        except (RuntimeError, ValueError, TypeError):
+            pass
+
+if args.disable_musa_grappler:
+    os.environ["MUSA_DISABLE_GRAPPLER"] = "1"
+
 _MUSA_OP_MODULE = None
 if args.backend == "musa":
     if args.lib_path is None:
         raise ValueError("--lib_path is required when --backend musa")
-    tf.load_library(args.lib_path)
-    # tf.load_library registers the MUSA device + kernels but does NOT make
-    # plugin-defined custom ops (e.g. MusaResourceApplyAdamMixed) accessible
-    # from Python: tf.raw_ops only contains ops baked into the TF wheel at
-    # build time, so plugin ops never appear there even when they are fully
-    # registered in the C++ op registry. tf.load_op_library on the same path
-    # re-uses the dlopen cache (no double registration) and returns a Python
-    # module whose attributes ARE the generated wrappers for those ops.
-    try:
-        _MUSA_OP_MODULE = tf.load_op_library(args.lib_path)
-    except Exception as _exc:  # pragma: no cover - depends on plugin contents
-        print(
-            f"[musa] tf.load_op_library({args.lib_path}) failed: {_exc}. "
-            f"Custom MUSA ops (e.g. MusaResourceApplyAdamMixed) will be "
-            f"unavailable from Python and the mixed Adam fast path will "
-            f"silently fall back to the stock Cast+Adam path.",
-            file=sys.stderr,
-        )
+    _MUSA_OP_MODULE = _load_musa_plugin(
+        args.lib_path, use_legacy_device=args.musa_legacy_device
+    )
+    # Always register musa_graph_optimizer; --disable_musa_grappler only sets
+    # MUSA_DISABLE_GRAPPLER=1 inside the optimizer (skips fusion, still dumps).
+    _configure_musa_grappler_process(enable_optimizer=True)
     _configure_musa_physical_devices(args.all_musa_devices, args.musa_device_index)
 
 if args.backend == "cuda":
@@ -430,14 +678,6 @@ if args.backend == "cuda":
 
 if args.enable_xla:
     tf.config.optimizer.set_jit(True)
-
-if args.disable_tf32:
-    set_tf32 = getattr(tf.config.experimental, "enable_tensor_float_32_execution", None)
-    if callable(set_tf32):
-        try:
-            set_tf32(False)
-        except (RuntimeError, ValueError, TypeError):
-            pass
 
 POLICY_NAME, MODEL_DTYPE = _configure_precision_policy(args.precision)
 LABEL_DTYPE = MODEL_DTYPE
@@ -499,10 +739,35 @@ logger.info(
     f"precision={args.precision}, keras_policy={POLICY_NAME}, "
     f"model_dtype={MODEL_DTYPE.name}, label_dtype={LABEL_DTYPE.name}, disable_tf32={args.disable_tf32}"
 )
+_MUSA_GRAPH_DUMP_DIR = None
 if args.backend == "musa":
     logger.info(
-        f"musa_device_index={args.musa_device_index}, all_musa_devices={args.all_musa_devices}"
+        f"musa_device_index={args.musa_device_index}, "
+        f"all_musa_devices={args.all_musa_devices}, "
+        f"musa_legacy_device={args.musa_legacy_device}, "
+        f"disable_musa_grappler={args.disable_musa_grappler}, "
+        f"dump_musa_graph={args.dump_musa_graph}"
     )
+    if args.disable_tf32:
+        logger.info("MUSA_ENABLE_TF32=0 (TF32 disabled for MUSA MatMul/Conv)")
+    _log_musa_runtime_config(args.lib_path, args.musa_legacy_device)
+    if args.dump_musa_graph:
+        _MUSA_GRAPH_DUMP_DIR = (
+            args.musa_graph_dump_dir
+            if args.musa_graph_dump_dir
+            else os.path.join(f"logs/{formatted_time}", "musa_graphs")
+        )
+        _enable_musa_graph_dump(
+            args.lib_path,
+            _MUSA_GRAPH_DUMP_DIR,
+            dump_text=args.musa_graph_dump_text,
+            dump_slim=args.musa_graph_dump_slim,
+        )
+        logger.info(
+            "MUSA GraphDef dumps will be written under %s when "
+            "musa_graph_optimizer runs (look for musa_optimizer_*.pb).",
+            _MUSA_GRAPH_DUMP_DIR,
+        )
 
 tensorboard_logdir = f"logs/{formatted_time}/tensorboard"
 summary_writer = tf.summary.create_file_writer(tensorboard_logdir)
@@ -1213,6 +1478,29 @@ def train_step(inputs, labels):
     other_optimizer.apply_gradients(other_grads)
 
     return loss
+
+
+if args.backend == "musa" and args.dump_musa_graph:
+    logger.info(
+        "Running one warmup train_step to trace the graph and trigger "
+        "musa_graph_optimizer GraphDef dumps..."
+    )
+    for warmup_inputs, warmup_labels in train_dataset.take(1):
+        _ = train_step(warmup_inputs, warmup_labels)
+        break
+    if _MUSA_GRAPH_DUMP_DIR:
+        dump_files = []
+        if os.path.isdir(_MUSA_GRAPH_DUMP_DIR):
+            dump_files = sorted(
+                f
+                for f in os.listdir(_MUSA_GRAPH_DUMP_DIR)
+                if f.startswith("musa_optimizer_")
+            )
+        logger.info(
+            "Warmup complete. GraphDef dump dir=%s, files=%s",
+            _MUSA_GRAPH_DUMP_DIR,
+            dump_files if dump_files else "(none yet — check TF logs for dump errors)",
+        )
 
 
 ####################################################################################################
